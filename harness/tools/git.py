@@ -35,6 +35,27 @@ def git_status() -> str:
     return _run_git("status", "--short")
 
 @tool
+def git_diff(path: str) -> str:
+    """Show the differences between the working tree and the index or the commit."""
+    args = ["diff"]
+    if path:
+        args.append(path)
+    return _run_git(*args)
+
+@tool
+def git_log(limit: int = 10) -> str:
+    """Show the commit history. If limit is provided, show the last limit commits."""
+    args = ["log"]
+    if limit:
+        args.append(f"--max-count={limit}")
+    return _run_git(*args, "--oneline")
+
+@tool
+def git_checkout(branch: str) -> str:
+    """Checkout a branch."""
+    return _run_git("checkout", branch)
+
+@tool
 def git_commit(message: str) -> str:
     """Commit the current changes."""
     stage_result = _run_git("add", "-A")
