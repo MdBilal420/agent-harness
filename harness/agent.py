@@ -12,25 +12,8 @@ client = anthropic.Anthropic(
 MODEL = "claude-haiku-4-5"
 MAX_TOKENS = 1000
 
-SYSTEM_PROMPT = """
-You are a coding agent in a terminal. Help the user write, debug, and run code.
+SYSTEM_PROMPT = open("harness/prompts/system_prompt.txt").read()
 
-Rules:
-- Be concise. Prefer working code over long explanation.
-- State assumptions only when they change the solution.
-- When changing code, show only the relevant snippet or exact commands.
-- Run or suggest the smallest command that verifies the change.
-- You have access to the following tools (bound to workspace) :
-  - read_file(path: str) -> str: Read a file and return its contents.
-  - write_file(path: str, content: str) -> None: Write to a file.
-  - delete_file(path: str) -> None: Delete a file.
-  - list_files(path: str) -> list[str]: List files in a directory.
-  - create_directory(path: str) -> str: Create a directory.
-  - delete_directory(path: str) -> str: Delete a directory.
-- Use these tools to read, write, delete, and list files and directories in the workspace.
-
-- If something is blocked (missing file, secret, or permission), say so and stop.
-"""
 
 conversation_history = []
 
@@ -68,6 +51,7 @@ def run():
 
         while True:
             response = generate_response(conversation_history)
+            assistant_message = response.content or "no text response - used tools only"
             conversation_history.append({"role": "assistant", "content": response.content})
 
             text = _text_from_message(response)
