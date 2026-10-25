@@ -62,6 +62,7 @@ def run():
             for block in response.content:
                 if block.type != "tool_use":
                     continue
+                print(f"Tool: {block.name}")
                 try:
                     result = registry.dispatch(block.name, block.input)
                     tool_results.append({
