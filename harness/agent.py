@@ -13,15 +13,30 @@ client = anthropic.Anthropic(
 MODEL = "claude-haiku-5-5"
 MAX_TOKENS = 8192
 
-SYSTEM_PROMPT = open("harness/prompts/system_prompt.txt").read()
+MAX_TOOL_CALLS = 100
+MAX_TOOL_ROUNDS = 25
+
+SYSTEM_PROMPT = open("harness/prompts/system_prompt.txt", encoding="utf-8").read()
+BUDGET_HIT_MESSAGE = """
+The tool execution budget for this turn has been exhausted.
+Do not request or execute any more tools.
+
+Respond directly to the user with:
+1. What you accomplished.
+2. What remains to be done.
+3. What the user should ask next to continue the work.
+"""
 
 
 conversation_history = []
 
-def generate_response(conversation_history, agents_md):
+def generate_response(conversation_history, agents_md, budget_hit=False):
     """Generate a response from the agent"""
 
     system_prompt = SYSTEM_PROMPT + "\n\n" + agents_md
+
+    if budget_hit:
+        system_prompt += "\n\n" + BUDGET_HIT_MESSAGE
 
     return client.messages.create(
         model=MODEL,
@@ -29,9 +44,10 @@ def generate_response(conversation_history, agents_md):
         system=system_prompt,
         messages=conversation_history,
         tools=registry.get_schemas(),
+        tool_choice={"type" : "none"} if budget_hit else {"type" : "auto"},
     )
 def _text_from_message(message):
-    return "".join(block.text for block in message.content if block.type == "text")
+    return "\n".join(block.text for block in message.content if block.type == "text")
 
 
 def run():
@@ -51,12 +67,30 @@ def run():
 
         conversation_history.append({"role": "user", "content": user_input})
 
+        tool_rounds = 0
+        tool_calls_used = 0
+        budget_hit = False
+
         while True:
-            response = generate_response(conversation_history, agents_md)
+            response = generate_response(conversation_history, agents_md, budget_hit)
             text = _text_from_message(response)
             conversation_history.append({"role": "assistant", "content": text})
             if response.stop_reason != "tool_use":
                 break
+
+            if tool_rounds >= MAX_TOOL_ROUNDS:
+                budget_hit = True
+                continue
+
+            tool_use_blocks = [
+                block
+                for block in response.content
+                if block.type == "tool_use"
+            ]
+
+            if tool_calls_used + len(tool_use_blocks) > MAX_TOOL_CALLS:
+                budget_hit = True
+                continue
 
             tool_results = []
             for block in response.content:
@@ -82,10 +116,13 @@ def run():
                     "role": "user",
                     "content": f"Tool results: {tool_results}",
                 })
+                tool_calls_used += len(tool_use_blocks)
+                tool_rounds += 1
+
         assistant_text = "\n".join(
             block.text for block in response.content if block.type == "text"
         ) or "(no text response)"
-        conversation_history.append({"role": "assistant", "content": assistant_text})
+
         print("\n \n Agent: " + assistant_text)
         print("--------------------------------")
 
