@@ -49,10 +49,6 @@ def _check_policy(command: str) -> str | None:
     tokens = [_first_token(seg) for seg in _segments(command)]
     tokens = [token for token in tokens if token]
 
-    print(f"Tokens: {tokens}")
-
-    print(f"DENY_LIST: {DENY_LIST}")
-    print(f"ALLOW_LIST: {ALLOW_LIST}")
     if DENY_LIST:
         for token in tokens:
             if token in DENY_LIST:

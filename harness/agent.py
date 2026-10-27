@@ -10,7 +10,7 @@ client = anthropic.Anthropic(
     api_key=os.getenv("ANTHROPIC_API_KEY"),
 )
 
-MODEL = "claude-haiku-5-5"
+MODEL = "claude-sonnet-5-5"
 MAX_TOKENS = 8192
 
 MAX_TOOL_CALLS = 100
