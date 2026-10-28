@@ -2,7 +2,7 @@ import subprocess
 from harness.tools.filesystem import WORKSPACE_PATH
 from harness.tools.registry import tool
 
-GIT_TIMEOUT = 10
+from harness.config import GIT_TIMEOUT
 
 
 def _run_git(*args: str) -> str:

@@ -2,25 +2,7 @@ import subprocess
 from harness.tools.filesystem import WORKSPACE_PATH
 from harness.tools.registry import tool
 
-
-BASH_TIMEOUT = 60
-ALLOW_LIST: set[str] = {
-    "ls",
-    "cd",
-    "pwd",
-    "mkdir",
-    "rm",
-    "cp",
-    "mv",
-    "pip",
-    "cat",
-    "python",
-    "python3",
-    "which",
-}
-DENY_LIST: set[str] = {
-    "dd"
-}
+from harness.config import BASH_TIMEOUT, ALLOW_LIST, DENY_LIST
 
 _CHAIN_SEPARATORS = ("&&", "|", ";", "||")
 

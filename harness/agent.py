@@ -3,6 +3,9 @@ import os
 from dotenv import load_dotenv
 from harness.tools import registry
 from harness.memory import load_agents_md
+from pathlib import Path
+
+from harness.config import MODEL, STEP_BUDGET, MAX_TOKENS
 
 load_dotenv()
 
@@ -10,11 +13,9 @@ client = anthropic.Anthropic(
     api_key=os.getenv("ANTHROPIC_API_KEY"),
 )
 
-MODEL = "claude-sonnet-5-5"
-MAX_TOKENS = 8192
 
 MAX_TOOL_CALLS = 100
-MAX_TOOL_ROUNDS = 25
+MAX_TOOL_ROUNDS = STEP_BUDGET
 
 SYSTEM_PROMPT = open("harness/prompts/system_prompt.txt", encoding="utf-8").read()
 BUDGET_HIT_MESSAGE = """
