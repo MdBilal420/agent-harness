@@ -39,19 +39,19 @@ ALLOW_LIST: set[str] = set({
     "python3",
     "which",
     "chmod",
+    "hostname"
 })
 
 # Deny-list of forbidden commands. Empty = no denials.
 # Precedence: deny wins on conflict.
 DENY_LIST: set[str] = set({
-    "rm -rf",
-    "rm -rf *",
-    "rm -rf **",
-    "rm -rf ***",
-    "rm -rf ****",
-    "rm -rf *****",
-    "rm -rf ******",
-    "rm -rf *******",
-    "rm -rf ********",
-    "rm -rf *********",
+    "rm -rf"
 })
+
+SANDBOX_IMAGE: str = "python:3.12-slim"
+
+SANDBOX_WORKSPACE_PATH: str = "/workspace"
+
+SANDBOX_STARTUP_TIMEOUT: int = 30
+
+SANDBOX_CONTAINER_PREFIX: str = "agent-harness-"

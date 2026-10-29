@@ -1,8 +1,16 @@
 import subprocess
 from harness.tools.filesystem import WORKSPACE_PATH
 from harness.tools.registry import tool
+from harness.sandbox import Sandbox
 
 from harness.config import BASH_TIMEOUT, ALLOW_LIST, DENY_LIST
+
+
+_sandbox: Sandbox | None = None
+
+def set_sandbox(sandbox: Sandbox) -> None:
+    global _sandbox
+    _sandbox = sandbox
 
 _CHAIN_SEPARATORS = ("&&", "|", ";", "||")
 
@@ -59,24 +67,15 @@ def bash(command: str) -> str:
     if policy_error:
         return policy_error
 
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            timeout=BASH_TIMEOUT,
-            cwd=WORKSPACE_PATH,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return "Command timed out"
-    except subprocess.CalledProcessError as e:
-        return f"Command failed with exit code {e.returncode}: {e.stderr}"
-    
-    output = _combine_output(result.stdout, result.stderr) or "(No output)"
+    if _sandbox is None:
+        print("Sandbox is not initialized")
+        raise ValueError("Sandbox is not initialized")
 
-    if result.returncode != 0:
-        return f"Command failed with exit code {result.returncode}: {output}"
-    
+    print(f"Executing command: {command}")
+    exit_code, stdout, stderr = _sandbox.execute(command)
+
+    output = _combine_output(stdout, stderr) or "(No output)"
+    if exit_code != 0:
+        return f"Command failed with exit code {exit_code}: {output}"
+
     return output
