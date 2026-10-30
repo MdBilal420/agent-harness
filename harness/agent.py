@@ -53,6 +53,22 @@ def _text_from_message(message):
     return "\n".join(block.text for block in message.content if block.type == "text")
 
 
+def _assistant_content(message) -> list[dict]:
+    """Serialize assistant content blocks for the next API request."""
+    blocks = []
+    for block in message.content:
+        if block.type == "text":
+            blocks.append({"type": "text", "text": block.text})
+        elif block.type == "tool_use":
+            blocks.append({
+                "type": "tool_use",
+                "id": block.id,
+                "name": block.name,
+                "input": block.input,
+            })
+    return blocks
+
+
 def run():
     """Run the agent's conversation loop until the user exits"""
 
@@ -82,14 +98,12 @@ def run():
 
             while True:
                 response = generate_response(conversation_history, agents_md, budget_hit)
-                text = _text_from_message(response)
-                conversation_history.append({"role": "assistant", "content": text})
+                conversation_history.append({
+                    "role": "assistant",
+                    "content": _assistant_content(response),
+                })
                 if response.stop_reason != "tool_use":
                     break
-
-                if tool_rounds >= MAX_TOOL_ROUNDS:
-                    budget_hit = True
-                    continue
 
                 tool_use_blocks = [
                     block
@@ -97,14 +111,30 @@ def run():
                     if block.type == "tool_use"
                 ]
 
-                if tool_calls_used + len(tool_use_blocks) > MAX_TOOL_CALLS:
+                # Every tool_use must be paired with a tool_result before the
+                # next API call. If the budget is exhausted, return error
+                # results and force a text-only summary on the next round.
+                if (
+                    tool_rounds >= MAX_TOOL_ROUNDS
+                    or tool_calls_used + len(tool_use_blocks) > MAX_TOOL_CALLS
+                ):
+                    conversation_history.append({
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": "Tool budget exhausted; result unavailable.",
+                                "is_error": True,
+                            }
+                            for block in tool_use_blocks
+                        ],
+                    })
                     budget_hit = True
                     continue
 
                 tool_results = []
-                for block in response.content:
-                    if block.type != "tool_use":
-                        continue
+                for block in tool_use_blocks:
                     print(f"Tool: {block.name}")
                     try:
                         result = registry.dispatch(block.name, block.input)
@@ -120,17 +150,14 @@ def run():
                             "content": f"Error executing tool: {str(e)}",
                             "is_error": True,
                         })
-                if tool_results:
-                    conversation_history.append({
-                        "role": "user",
-                        "content": f"Tool results: {tool_results}",
-                    })
-                    tool_calls_used += len(tool_use_blocks)
-                    tool_rounds += 1
+                conversation_history.append({
+                    "role": "user",
+                    "content": tool_results,
+                })
+                tool_calls_used += len(tool_use_blocks)
+                tool_rounds += 1
 
-            assistant_text = "\n".join(
-                block.text for block in response.content if block.type == "text"
-            ) or "(no text response)"
+            assistant_text = _text_from_message(response) or "(no text response)"
 
             print("\n \n Agent: " + assistant_text)
             print("--------------------------------")

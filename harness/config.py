@@ -26,29 +26,39 @@ GIT_TIMEOUT: int = 10
 # Allow-list of permitted commands (matched against the first token of
 # each chain segment). Empty = permissive.
 ALLOW_LIST: set[str] = set({
-    "ls",
-    "cd",
-    "pwd",
-    "mkdir",
-    "rm",
-    "cp",
-    "mv",
-    "pip",
-    "cat",
     "python",
     "python3",
+    "pip",
+    "pip3",
+
+    "ls",
+    "cat",
+    "wc",
+    "grep",
+    "find",
+    "head",
+    "tail",
+
+    "curl",
+
     "which",
-    "chmod",
-    "hostname"
+    "echo",
+    "pwd",
+
+    "git"
 })
 
 # Deny-list of forbidden commands. Empty = no denials.
 # Precedence: deny wins on conflict.
 DENY_LIST: set[str] = set({
-    "rm -rf"
+    "rm",
+    "sudo",
+    "dd",
+    "mkfs",
+    "mv"
 })
 
-SANDBOX_IMAGE: str = "python:3.12-slim"
+SANDBOX_IMAGE: str = "agent-harness:0.1"
 
 SANDBOX_WORKSPACE_PATH: str = "/workspace"
 
