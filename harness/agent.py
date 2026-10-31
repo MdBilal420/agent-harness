@@ -2,7 +2,12 @@ import anthropic
 import os
 from dotenv import load_dotenv
 from harness.tools import registry
-from harness.memory import load_agents_md
+from harness.memory import (
+    CATEGORY_HEADERS,
+    load_agents_md,
+    validate_agents_md_structure,
+    save_agents_md,
+)
 from harness.sandbox import Sandbox
 from pathlib import Path
 from harness.tools.bash import set_sandbox
@@ -19,7 +24,6 @@ client = anthropic.Anthropic(
 MAX_TOOL_CALLS = 100
 MAX_TOOL_ROUNDS = STEP_BUDGET
 
-SYSTEM_PROMPT = open("harness/prompts/system_prompt.txt", encoding="utf-8").read()
 BUDGET_HIT_MESSAGE = """
 The tool execution budget for this turn has been exhausted.
 Do not request or execute any more tools.
@@ -29,6 +33,9 @@ Respond directly to the user with:
 2. What remains to be done.
 3. What the user should ask next to continue the work.
 """
+
+SYSTEM_PROMPT = open("harness/prompts/system_prompt.txt", encoding="utf-8").read()
+SESSION_END_MEMORY_PROMPT = open("harness/prompts/session_end_memory.txt", encoding="utf-8").read()
 
 
 conversation_history = []
@@ -69,6 +76,48 @@ def _assistant_content(message) -> list[dict]:
     return blocks
 
 
+def _consolidate_memory(conversation_history) -> None:
+    """Consolidate the memory of the session"""
+
+    print("Consolidating memory...")
+    try:
+        current_agents_md = load_agents_md()
+
+        consolidation_context = (
+            f"{SESSION_END_MEMORY_PROMPT}\n\n"
+            f"Current AGENTS.md:\n{current_agents_md}\n\n"
+        )
+
+        consolidation_messages = conversation_history + [
+            {"role": "user", "content": consolidation_context},
+        ]
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            messages=consolidation_messages,
+        )
+        assistant_text = _text_from_message(response)
+
+        if not assistant_text.strip():
+            print("No memory consolidation needed")
+            return
+
+        print("New AGENTS.md:\n" + assistant_text)
+        if not validate_agents_md_structure(assistant_text):
+            missing = [
+                header
+                for header in CATEGORY_HEADERS.values()
+                if header not in assistant_text
+            ]
+            print(f"Invalid AGENTS.md structure; missing headers: {missing}")
+            return
+
+        save_agents_md(assistant_text)
+        print("Memory consolidated successfully")
+    except Exception as e:
+        print(f"Error consolidating memory: {e}")
+        raise e
+
 def run():
     """Run the agent's conversation loop until the user exits"""
 
@@ -84,6 +133,7 @@ def run():
         while True:
             user_input = input("You: ")
             if user_input.lower() == "exit":
+                _consolidate_memory(conversation_history)
                 print("Exiting...")
                 break
             
