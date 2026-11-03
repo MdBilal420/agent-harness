@@ -65,3 +65,5 @@ SANDBOX_WORKSPACE_PATH: str = "/workspace"
 SANDBOX_STARTUP_TIMEOUT: int = 30
 
 SANDBOX_CONTAINER_PREFIX: str = "agent-harness-"
+
+WEB_SEARCH_MAX_RESULTS: int = 5
