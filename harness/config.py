@@ -67,3 +67,16 @@ SANDBOX_STARTUP_TIMEOUT: int = 30
 SANDBOX_CONTAINER_PREFIX: str = "agent-harness-"
 
 WEB_SEARCH_MAX_RESULTS: int = 5
+
+
+RAG_CORPUS_PATH: str = "knowledge"
+
+RAG_INDEX_PATH: str = ".rag_index"
+
+RAG_EMBEDDING_MODEL: str = "voyage-4-lite"
+
+RAG_CHUNK_SIZE: int = 500
+
+RAG_CHUNK_OVERLAP: int = 50
+
+RAG_DEFAULT_RESULTS: int = 5
