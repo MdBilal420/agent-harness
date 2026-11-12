@@ -11,3 +11,4 @@ build/
 .env
 workspace/
 .rag_index/
+.harness

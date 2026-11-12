@@ -12,7 +12,9 @@ from harness.sandbox import Sandbox
 from pathlib import Path
 from harness.tools.bash import set_sandbox
 
-from harness.config import MODEL, STEP_BUDGET, MAX_TOKENS
+from harness.config import MODEL, STEP_BUDGET, MAX_TOKENS, COMPACTION_THRESHOLD, COMPACTION_KEEP_RECENT
+from harness.context import Compactor
+
 
 load_dotenv()
 
@@ -118,6 +120,24 @@ def _consolidate_memory(conversation_history) -> None:
         print(f"Error consolidating memory: {e}")
         raise e
 
+def _run_compact(compactor, conversation_history):
+    "Run the compaction"
+    before = compactor.get_last_token_count()
+    new_messages = compactor.compact(conversation_history)
+
+    if new_messages is None:
+        print("Skipping compaction: no older messages to summarise")
+        return
+
+    conversation_history.clear()
+    conversation_history.extend(new_messages)
+    print(f"Context compacted from {before} to {compactor.get_last_token_count()} tokens")
+
+    approx_after = compactor.approximate_char_count(conversation_history)
+    print(f"Approximate context size after compaction: {approx_after} characters")
+
+    print("Compaction complete")
+
 def run():
     """Run the agent's conversation loop until the user exits"""
 
@@ -127,10 +147,20 @@ def run():
     sandbox = Sandbox()
     sandbox.start()
     set_sandbox(sandbox)
+
+    compactor = Compactor(client)
     
     try:
         agents_md = load_agents_md()
         while True:
+
+            if compactor.should_compact():
+                _run_compact(compactor, conversation_history)
+
+            current_tokens = compactor.get_last_token_count()
+            if current_tokens > 0:
+                print(f"Current token count: {current_tokens} / {COMPACTION_THRESHOLD}")
+
             user_input = input("You: ")
             if user_input.lower() == "exit":
                 _consolidate_memory(conversation_history)
@@ -138,6 +168,10 @@ def run():
                 break
             
             if not user_input.strip():
+                continue
+            
+            if user_input.lower() == "/compact":
+                _run_compact(compactor, conversation_history)
                 continue
 
             conversation_history.append({"role": "user", "content": user_input})
@@ -152,6 +186,10 @@ def run():
                     "role": "assistant",
                     "content": _assistant_content(response),
                 })
+
+                if response.usage:
+                    compactor.record_token_usage(response.usage.input_tokens)
+
                 if response.stop_reason != "tool_use":
                     break
 

@@ -3,7 +3,7 @@
 """
 
 # -- Model configuration --
-MODEL: str = "claude-sonnet-5-5"
+MODEL: str = "claude-haiku-5-5"
 MAX_TOKENS = 8192
 
 
@@ -68,6 +68,7 @@ SANDBOX_CONTAINER_PREFIX: str = "agent-harness-"
 
 WEB_SEARCH_MAX_RESULTS: int = 5
 
+# RAG configuration
 
 RAG_CORPUS_PATH: str = "knowledge"
 
@@ -80,3 +81,9 @@ RAG_CHUNK_SIZE: int = 500
 RAG_CHUNK_OVERLAP: int = 50
 
 RAG_DEFAULT_RESULTS: int = 5
+
+# Compaction
+
+COMPACTION_THRESHOLD: int = 30000
+
+COMPACTION_KEEP_RECENT: int = 3
