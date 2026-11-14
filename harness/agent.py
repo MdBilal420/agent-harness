@@ -104,7 +104,6 @@ def _consolidate_memory(conversation_history) -> None:
             print("No memory consolidation needed")
             return
 
-        print("New AGENTS.md:\n" + assistant_text)
         if not validate_agents_md_structure(assistant_text):
             missing = [
                 header
@@ -223,7 +222,6 @@ def run():
 
                 tool_results = []
                 for block in tool_use_blocks:
-                    print(f"Tool: {block.name}")
                     try:
                         result = registry.dispatch(block.name, block.input)
                         tool_results.append({

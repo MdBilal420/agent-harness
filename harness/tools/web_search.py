@@ -4,7 +4,7 @@ from tavily import TavilyClient
 from harness.tools.registry import tool
 from harness.config import WEB_SEARCH_MAX_RESULTS
 
-client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+
 
 
 def _format_results(results: dict, query: str) -> str:
@@ -44,9 +44,22 @@ def web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> str:
     if max_results is None:
         max_results = WEB_SEARCH_MAX_RESULTS
     
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        raise ValueError("TAVILY_API_KEY is not set")
+    
     try:
-        response = client.search(query=query, max_results=max_results, include_answer=True)
+        client = TavilyClient(api_key=api_key)
+        response = client.search(
+            query=query, 
+            max_results=max_results, 
+            include_answer=True,
+            include_usage=True
+        )
+        print(f"Web Search Response: {response}")
     except Exception as e:
+        print(f"Error searching the web: {e}")
         return f"Error searching the web: {e}"
     
-    return _format_results(response, query)
+    final_results = _format_results(response, query)
+    return final_results

@@ -6,11 +6,7 @@ File system tools : read, write, delete, list - bounded to workspace
 from harness.tools.registry import tool
 from pathlib import Path
 
-# Workspace path 
-WORKSPACE_PATH = Path("./workspace").resolve()
-
-# Create workspace directory if it doesn't exist
-WORKSPACE_PATH.mkdir(parents=True, exist_ok=True)
+from harness.config import WORKSPACE_PATH
 
 
 def _resolve_path(path: str) -> Path:

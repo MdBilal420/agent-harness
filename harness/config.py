@@ -2,6 +2,16 @@
 
 """
 
+from pathlib import Path
+
+
+# Workspace path 
+WORKSPACE_PATH = Path("./workspace").resolve()
+
+# Create workspace directory if it doesn't exist
+WORKSPACE_PATH.mkdir(parents=True, exist_ok=True)
+
+
 # -- Model configuration --
 MODEL: str = "claude-haiku-5-5"
 MAX_TOKENS = 8192
@@ -84,6 +94,18 @@ RAG_DEFAULT_RESULTS: int = 5
 
 # Compaction
 
-COMPACTION_THRESHOLD: int = 30000
+# COMPACTION_THRESHOLD: int = 30000
+COMPACTION_THRESHOLD: int = 10000000
+
 
 COMPACTION_KEEP_RECENT: int = 3
+
+# Tool Offloading
+
+# OFFLOAD_THRESHOLD_TOKENS: int = 1000
+OFFLOAD_THRESHOLD_TOKENS: int = 1000000
+
+
+OFFLOAD_HEAD_TOKENS: int = 300
+
+OFFLOAD_TAIL_TOKENS: int = 300

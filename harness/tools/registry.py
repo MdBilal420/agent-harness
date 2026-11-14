@@ -8,6 +8,8 @@ from typing import Any, Callable, get_type_hints
 from pydantic import TypeAdapter
 import inspect
 
+from harness.context.offloader import maybe_offload
+
 @dataclass
 class Tool:
     """
@@ -47,10 +49,13 @@ class ToolRegistry:
         if name not in self._tools:
             raise ValueError(f"Tool {name} not found")
 
+        print(f"Tool: {name} Arguments: {arguments}")
+
         try:
             tool = self._tools[name]
             result = tool.func(**arguments)
-            return str(result)
+            result_str = str(result)
+            return maybe_offload(name, result_str)
         except Exception as e:
             return f"Error calling tool {name}: {e}"
 
