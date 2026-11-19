@@ -94,18 +94,36 @@ RAG_DEFAULT_RESULTS: int = 5
 
 # Compaction
 
-# COMPACTION_THRESHOLD: int = 30000
-COMPACTION_THRESHOLD: int = 10000000
+COMPACTION_THRESHOLD: int = 30000
+# COMPACTION_THRESHOLD: int = 10000000
 
 
 COMPACTION_KEEP_RECENT: int = 3
 
 # Tool Offloading
 
-# OFFLOAD_THRESHOLD_TOKENS: int = 1000
-OFFLOAD_THRESHOLD_TOKENS: int = 1000000
+OFFLOAD_THRESHOLD_TOKENS: int = 1000
+# OFFLOAD_THRESHOLD_TOKENS: int = 1000000
 
 
 OFFLOAD_HEAD_TOKENS: int = 300
 
 OFFLOAD_TAIL_TOKENS: int = 300
+
+# Planning Support
+
+PLAN_FILENAME: str = "plan.md"
+
+PLAN_REMINDER_INTERVAL: int = 2
+
+PLAN_INJECTION_MAX_CHARS: int = 5000
+
+PLAN_GATED_TOOLS: set[str] = {
+    "write_file",
+    "delete_file",
+    "create_directory",
+    "bash",
+    "git_commit",
+    "git_checkout",
+    "git_branch",
+}

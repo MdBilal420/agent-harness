@@ -6,7 +6,7 @@ File system tools : read, write, delete, list - bounded to workspace
 from harness.tools.registry import tool
 from pathlib import Path
 
-from harness.config import WORKSPACE_PATH
+from harness.config import WORKSPACE_PATH, PLAN_FILENAME
 
 
 def _resolve_path(path: str) -> Path:
@@ -35,6 +35,17 @@ def write_file(path: str, content: str) -> None:
     """
     Write to a file.
     """
+
+    if path == "AGENTS.md" or path.endswith("/AGENTS.md"):
+        return (
+            "[write] Use 'remeber' tool instead of write_file"
+        )
+    
+    if path == PLAN_FILENAME or path.endswith(f"/{PLAN_FILENAME}"):
+        return (
+            "[write] Use 'update_plan' tool instead of write_file"
+        )
+    
     target_path = _resolve_path(path)
     target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text(content)

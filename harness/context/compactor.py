@@ -245,10 +245,6 @@ class Compactor:
         """Record total input usage, including cached input tokens."""
         usage = response.usage
 
-        print("USAGA")
-        print("Input tokens: ", usage.input_tokens)
-        print("Cache creation input tokens: ", getattr(usage, "cache_creation_input_tokens", 0))
-        print("Cache read input tokens: ", getattr(usage, "cache_read_input_tokens", 0))
         total = (
             usage.input_tokens
             + getattr(usage, "cache_creation_input_tokens", 0)

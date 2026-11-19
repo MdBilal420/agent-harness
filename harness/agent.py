@@ -1,256 +1,547 @@
-import anthropic
 import os
+from pathlib import Path
+
+import anthropic
 from dotenv import load_dotenv
+
 from harness.tools import registry
-from harness.memory import (
-    CATEGORY_HEADERS,
-    load_agents_md,
-    validate_agents_md_structure,
-    save_agents_md,
+from harness.config import (
+    STEP_BUDGET,
+    COMPACTION_THRESHOLD,
+    COMPACTION_KEEP_RECENT,
+    PLAN_REMINDER_INTERVAL,
+    PLAN_FILENAME,
+    PLAN_GATED_TOOLS,
 )
 from harness.sandbox import Sandbox
-from pathlib import Path
 from harness.tools.bash import set_sandbox
 
-from harness.config import MODEL, STEP_BUDGET, MAX_TOKENS, COMPACTION_THRESHOLD, COMPACTION_KEEP_RECENT
+from harness.memory import (
+    load_agents_md,
+    save_agents_md,
+    validate_agents_md_structure,
+)
+
 from harness.context import Compactor
+
+from harness.planning import (
+    load_plan_for_injection,
+    has_open_items,
+    plan_exists,
+    build_reminder_message,
+    build_create_plan_reminder,
+)
 
 
 load_dotenv()
+
+MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5")
+MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "8192"))
 
 client = anthropic.Anthropic(
     api_key=os.getenv("ANTHROPIC_API_KEY"),
 )
 
 
-MAX_TOOL_CALLS = 100
-MAX_TOOL_ROUNDS = STEP_BUDGET
+# Tool budget message.
+BUDGET_HIT_MESSAGE = f"""
+You've reached the step budget for this turn
+({STEP_BUDGET} tool-calling rounds).
 
-BUDGET_HIT_MESSAGE = """
-The tool execution budget for this turn has been exhausted.
-Do not request or execute any more tools.
+Do not make any more tool calls.
 
 Respond directly to the user with:
-1. What you accomplished.
+
+1. What you accomplished in this turn.
 2. What remains to be done.
 3. What the user should ask next to continue the work.
+
+Your response will be the final message for this turn.
+The user will reply to it and you can continue from there.
 """
 
-SYSTEM_PROMPT = open("harness/prompts/system_prompt.txt", encoding="utf-8").read()
-SESSION_END_MEMORY_PROMPT = open("harness/prompts/session_end_memory.txt", encoding="utf-8").read()
+
+SYSTEM_PROMPT = (
+    Path(__file__).parent / "prompts" / "system_prompt.txt"
+).read_text()
+
+SESSION_END_MEMORY_PROMPT = (
+    Path(__file__).parent / "prompts" / "session_end_memory.txt"
+).read_text()
 
 
-conversation_history = []
+# ---------------------------------------------------------
+# Tool schema conversion
+# ---------------------------------------------------------
 
-def generate_response(conversation_history, agents_md, budget_hit=False):
-    """Generate a response from the agent"""
+def get_anthropic_tools() -> list[dict]:
+    """Convert registry schemas into Anthropic tool schemas."""
 
-    system_prompt = SYSTEM_PROMPT + "\n\n" + agents_md
+    tools = []
 
-    if budget_hit:
-        system_prompt += "\n\n" + BUDGET_HIT_MESSAGE
+    for schema in registry.get_schemas():
+
+        # Convert OpenAI function schema.
+        if schema.get("type") == "function":
+            function = schema["function"]
+
+            tools.append({
+                "name": function["name"],
+                "description": function.get("description", ""),
+                "input_schema": function.get(
+                    "parameters",
+                    {
+                        "type": "object",
+                        "properties": {},
+                    },
+                ),
+            })
+
+        else:
+            # Already in Anthropic format.
+            tools.append(schema)
+
+    return tools
+
+
+# ---------------------------------------------------------
+# System prompt construction
+# ---------------------------------------------------------
+
+def build_system_prompt(
+    agents_md: str,
+    plan_content: str | None = None,
+    extra_context: str = "",
+) -> str:
+    """Build the system prompt for the current model call."""
+
+    parts = [
+        SYSTEM_PROMPT,
+        f"# Project Memory (AGENTS.md)\n\n{agents_md}",
+    ]
+
+    if plan_content:
+        parts.append(
+            f"# Current Plan (workspace/plan.md)\n\n{plan_content}"
+        )
+
+    if extra_context:
+        parts.append(extra_context)
+
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------
+# Anthropic API
+# ---------------------------------------------------------
+
+def generate_response(
+    messages: list,
+    system_prompt: str,
+    tools: list,
+    force_no_tools: bool = False,
+):
+    """Generate a response using Anthropic's Messages API."""
 
     return client.messages.create(
         model=MODEL,
-        max_tokens=MAX_TOKENS, 
+        max_tokens=MAX_TOKENS,
         system=system_prompt,
-        messages=conversation_history,
-        tools=registry.get_schemas(),
-        tool_choice={"type" : "none"} if budget_hit else {"type" : "auto"},
+        messages=messages,
+        tools=tools,
+        tool_choice=(
+            {"type": "none"}
+            if force_no_tools
+            else {"type": "auto"}
+        ),
     )
-def _text_from_message(message):
-    return "\n".join(block.text for block in message.content if block.type == "text")
 
 
-def _assistant_content(message) -> list[dict]:
-    """Serialize assistant content blocks for the next API request."""
-    blocks = []
-    for block in message.content:
-        if block.type == "text":
-            blocks.append({"type": "text", "text": block.text})
-        elif block.type == "tool_use":
-            blocks.append({
-                "type": "tool_use",
-                "id": block.id,
-                "name": block.name,
-                "input": block.input,
-            })
-    return blocks
+def extract_text(response) -> str:
+    """Extract text blocks from an Anthropic response."""
+
+    return "\n".join(
+        block.text
+        for block in response.content
+        if block.type == "text"
+    )
 
 
-def _consolidate_memory(conversation_history) -> None:
-    """Consolidate the memory of the session"""
+def get_tool_use_blocks(response) -> list:
+    """Extract tool_use blocks from an Anthropic response."""
+
+    return [
+        block
+        for block in response.content
+        if block.type == "tool_use"
+    ]
+
+
+# ---------------------------------------------------------
+# Session-end memory consolidation
+# ---------------------------------------------------------
+
+def _consolidate_memory(messages: list, client) -> None:
+    """Consolidate session history into AGENTS.md."""
 
     print("Consolidating memory...")
+
     try:
         current_agents_md = load_agents_md()
 
-        consolidation_context = (
+        consolidation_system = (
             f"{SESSION_END_MEMORY_PROMPT}\n\n"
-            f"Current AGENTS.md:\n{current_agents_md}\n\n"
+            f"=== Current AGENTS.md ===\n"
+            f"{current_agents_md}"
         )
 
-        consolidation_messages = conversation_history + [
-            {"role": "user", "content": consolidation_context},
-        ]
+        # Conversation history contains only Anthropic-compatible
+        # user and assistant messages.
+        # System instructions are passed separately.
         response = client.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
-            messages=consolidation_messages,
+            system=consolidation_system,
+            messages=messages,
         )
-        assistant_text = _text_from_message(response)
 
-        if not assistant_text.strip():
-            print("No memory consolidation needed")
+        proposed = extract_text(response).strip()
+
+        if not proposed:
+            print(
+                "Memory consolidation returned empty content. "
+                "Keeping current AGENTS.md."
+            )
             return
 
-        if not validate_agents_md_structure(assistant_text):
-            missing = [
-                header
-                for header in CATEGORY_HEADERS.values()
-                if header not in assistant_text
-            ]
-            print(f"Invalid AGENTS.md structure; missing headers: {missing}")
+        if not validate_agents_md_structure(proposed):
+            print(
+                "Memory consolidation returned malformed structure "
+                "(missing section headers). Keeping current AGENTS.md."
+            )
             return
 
-        save_agents_md(assistant_text)
-        print("Memory consolidated successfully")
+        save_agents_md(proposed)
+        print("Memory updated.")
+
     except Exception as e:
-        print(f"Error consolidating memory: {e}")
-        raise e
+        print(
+            f"Memory consolidation failed: {e}. "
+            "Keeping current AGENTS.md."
+        )
 
-def _run_compact(compactor, conversation_history):
-    "Run the compaction"
+
+# ---------------------------------------------------------
+# Context compaction
+# ---------------------------------------------------------
+
+def _run_compaction(
+    compactor: Compactor,
+    messages: list,
+) -> None:
+    """Run compaction and update the conversation history."""
+
     before = compactor.get_last_token_count()
-    new_messages = compactor.compact(conversation_history)
+
+    new_messages = compactor.compact(messages)
 
     if new_messages is None:
-        print("Skipping compaction: no older messages to summarise")
+        print(
+            "[Compaction skipped: not enough older history to summarize "
+            f"(need more than {COMPACTION_KEEP_RECENT} user turns).]"
+        )
         return
 
-    conversation_history.clear()
-    conversation_history.extend(new_messages)
-    print(f"Context compacted from {before} to {compactor.get_last_token_count()} tokens")
+    messages.clear()
+    messages.extend(new_messages)
 
-    approx_after = compactor.approximate_char_count(conversation_history)
-    print(f"Approximate context size after compaction: {approx_after} characters")
+    approximate_after = compactor.approximate_char_count(messages)
 
-    print("Compaction complete")
+    print(
+        f"[Context compacted at {before:,} tokens "
+        f"→ ~{approximate_after:,} tokens. "
+        f"Full history: .harness/context_log.jsonl]"
+    )
+
+
+# ---------------------------------------------------------
+# Tool dispatch
+# ---------------------------------------------------------
+
+def dispatch_tools(tool_blocks: list) -> list[dict]:
+    """Execute Anthropic tool calls and return structured results."""
+
+    tool_results = []
+    needs_plan = not plan_exists()
+
+    for block in tool_blocks:
+        print(f"Tool: {block.name}")
+
+        # Soft prompts were ignored; refuse mutating work until plan.md exists.
+        if needs_plan and block.name in PLAN_GATED_TOOLS:
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": (
+                    f"[planning] Refused `{block.name}` because plan.md does "
+                    "not exist yet. Call update_plan(task, status=\"todo\") "
+                    "once per subtask to create the plan, then retry this tool."
+                ),
+                "is_error": True,
+            })
+            print(f"[planning] gated {block.name} — no plan.md yet")
+            continue
+
+        try:
+            result = registry.dispatch(
+                block.name,
+                block.input,
+            )
+
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": str(result),
+            })
+
+            if block.name == "update_plan":
+                needs_plan = not plan_exists()
+
+        except Exception as e:
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": f"Tool execution failed: {e}",
+                "is_error": True,
+            })
+
+    return tool_results
+
+
+# ---------------------------------------------------------
+# Main agent loop
+# ---------------------------------------------------------
 
 def run():
-    """Run the agent's conversation loop until the user exits"""
+    """Run the agent's conversation loop until the user quits."""
 
-    print("Welcome to the agent! Type 'exit' to end the conversation.")
-    print("--------------------------------")
-
+    # Step 1: Start sandbox and connect it to the bash tool.
     sandbox = Sandbox()
     sandbox.start()
     set_sandbox(sandbox)
 
+    # Create one Compactor for the entire session.
     compactor = Compactor(client)
-    
+
     try:
+        # Step 2: Load persistent project memory.
         agents_md = load_agents_md()
+
+        # Anthropic keeps system instructions outside conversation history.
+        plan_content = load_plan_for_injection()
+
+        print(f"Plan content: {plan_content}")
+        print(f"Agents MD: {agents_md}")
+
+        system_prompt = build_system_prompt(
+            agents_md=agents_md,
+            plan_content=plan_content,
+        )
+
+        if plan_content is not None:
+            print(
+                f"[Loaded plan.md into context: "
+                f"{len(plan_content):,} chars]"
+            )
+
+        # Conversation history contains only user and assistant messages.
+        messages = []
+
+        # Convert tool schemas once per session.
+        tools = get_anthropic_tools()
+
+        # Track planning reminder interval across turns.
+        turns_since_reminder = 0
+
+        print(
+            "Agent ready. Type 'quit' or 'exit' to leave. "
+            "Type /compact to force compaction.\n"
+        )
+
         while True:
 
+            # -------------------------------------------------
+            # Automatic compaction
+            # -------------------------------------------------
+
             if compactor.should_compact():
-                _run_compact(compactor, conversation_history)
+                _run_compaction(compactor, messages)
 
             current_tokens = compactor.get_last_token_count()
+
             if current_tokens > 0:
-                print(f"Current token count: {current_tokens} / {COMPACTION_THRESHOLD}")
+                print(
+                    f"[Context: {current_tokens:,} / "
+                    f"{COMPACTION_THRESHOLD:,} tokens]"
+                )
 
-            user_input = input("You: ")
-            if user_input.lower() == "exit":
-                _consolidate_memory(conversation_history)
-                print("Exiting...")
+            # -------------------------------------------------
+            # User input
+            # -------------------------------------------------
+
+            user_input = input("you > ").strip()
+
+            if user_input.lower() in {"quit", "exit"}:
+                _consolidate_memory(messages, client)
+                print("Goodbye.")
                 break
-            
-            if not user_input.strip():
-                continue
-            
-            if user_input.lower() == "/compact":
-                _run_compact(compactor, conversation_history)
+
+            if not user_input:
                 continue
 
-            conversation_history.append({"role": "user", "content": user_input})
+            # Manual compaction.
+            if user_input == "/compact":
+                _run_compaction(compactor, messages)
+                continue
 
-            tool_rounds = 0
-            tool_calls_used = 0
+            messages.append({
+                "role": "user",
+                "content": user_input,
+            })
+
+            # -------------------------------------------------
+            # Planning reminder
+            # -------------------------------------------------
+
+            turns_since_reminder += 1
+
+            # Always refresh plan content from disk so updates stick mid-session.
+            plan_content = load_plan_for_injection()
+
+            reminder = None
+            if not plan_exists():
+                # Inject on every turn until a plan exists (interval alone
+                # skipped turn 1, which is when most scaffolding happens).
+                reminder = build_create_plan_reminder()
+            elif (
+                turns_since_reminder >= PLAN_REMINDER_INTERVAL
+                and has_open_items()
+            ):
+                reminder = build_reminder_message()
+                turns_since_reminder = 0
+
+            turn_system_prompt = build_system_prompt(
+                agents_md=agents_md,
+                plan_content=plan_content,
+                extra_context=reminder or "",
+            )
+
+            if reminder:
+                print(
+                    f"[Planning reminder injected — "
+                    f"{turns_since_reminder} turns since last]"
+                )
+
+            # -------------------------------------------------
+            # ReAct dispatch loop
+            # -------------------------------------------------
+
+            step_count = 0
             budget_hit = False
 
             while True:
-                response = generate_response(conversation_history, agents_md, budget_hit)
-                conversation_history.append({
+
+                response = generate_response(
+                    messages=messages,
+                    system_prompt=(
+                        turn_system_prompt
+                        if not budget_hit
+                        else turn_system_prompt + "\n\n" + BUDGET_HIT_MESSAGE
+                    ),
+                    tools=tools,
+                    force_no_tools=budget_hit,
+                )
+
+                # Record Anthropic token usage.
+                compactor.record_response_usage(response)
+
+                # Preserve the complete assistant response.
+                # This includes text and tool_use blocks.
+                messages.append({
                     "role": "assistant",
-                    "content": _assistant_content(response),
+                    "content": response.content,
                 })
 
-                if response.usage:
-                    compactor.record_token_usage(response.usage.input_tokens)
+                tool_blocks = get_tool_use_blocks(response)
 
+                # Model has finished its turn.
                 if response.stop_reason != "tool_use":
                     break
 
-                tool_use_blocks = [
-                    block
-                    for block in response.content
-                    if block.type == "tool_use"
-                ]
+                # Budget exhausted: do not execute the requested tools.
+                # Instead, return error results for every pending tool_use
+                # so the Anthropic conversation remains valid.
+                if step_count >= STEP_BUDGET:
+                    budget_hit = True
 
-                # Every tool_use must be paired with a tool_result before the
-                # next API call. If the budget is exhausted, return error
-                # results and force a text-only summary on the next round.
-                if (
-                    tool_rounds >= MAX_TOOL_ROUNDS
-                    or tool_calls_used + len(tool_use_blocks) > MAX_TOOL_CALLS
-                ):
-                    conversation_history.append({
+                    messages.append({
                         "role": "user",
                         "content": [
                             {
                                 "type": "tool_result",
                                 "tool_use_id": block.id,
-                                "content": "Tool budget exhausted; result unavailable.",
+                                "content": (
+                                    "Tool execution budget exhausted. "
+                                    "This tool was not executed."
+                                ),
                                 "is_error": True,
                             }
-                            for block in tool_use_blocks
+                            for block in tool_blocks
                         ],
                     })
-                    budget_hit = True
+
                     continue
 
-                tool_results = []
-                for block in tool_use_blocks:
-                    try:
-                        result = registry.dispatch(block.name, block.input)
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": str(result),
-                        })
-                    except Exception as e:
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": f"Error executing tool: {str(e)}",
-                            "is_error": True,
-                        })
-                conversation_history.append({
+                if not tool_blocks:
+                    raise RuntimeError(
+                        "Anthropic returned stop_reason='tool_use' "
+                        "without any tool_use blocks."
+                    )
+
+                # Execute all requested tools.
+                tool_results = dispatch_tools(tool_blocks)
+
+                # Append structured results as a user message.
+                messages.append({
                     "role": "user",
                     "content": tool_results,
                 })
-                tool_calls_used += len(tool_use_blocks)
-                tool_rounds += 1
 
-            assistant_text = _text_from_message(response) or "(no text response)"
+                step_count += 1
 
-            print("\n \n Agent: " + assistant_text)
-            print("--------------------------------")
+            # -------------------------------------------------
+            # Final assistant response
+            # -------------------------------------------------
+
+            assistant_text = extract_text(response)
+
+            if not assistant_text:
+                raise RuntimeError(
+                    "Agent loop terminated without a text response. "
+                    "Check the API response and termination logic."
+                )
+
+            # The complete assistant response was already appended
+            # to history, so do not append it a second time.
+
+            print(f"\nagent > {assistant_text}\n")
+
     finally:
-        print("Shutting down sandbox...")
+        # Always stop the sandbox, even if an exception occurs.
+        print("Stopping sandbox...")
         sandbox.stop()
-        print("Sandbox stopped")
+        print("Sandbox stopped.")
+
 
 if __name__ == "__main__":
     run()

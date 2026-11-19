@@ -61,6 +61,6 @@ def maybe_offload(tool_name: str, result: str) -> str:
     marker = (
         f"\n... [TRUNCATED TO {total_tokens} TOKENS] ..."
         f"\n... [OFFLOADED TO {relative_path}] ..."
-        f"Call read() to retrieve the full output."
+        f"Call read_file() to retrieve the full output."
     )
     return head + marker + tail
