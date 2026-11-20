@@ -11,6 +11,12 @@ from harness.config import (
     COMPACTION_KEEP_RECENT,
 )
 
+from harness.spend import (
+    get_session_spend,
+    record_session_spend,
+    SpendLimitExceeded,
+)
+
 
 SUMMARIZATION_MAX_TOKENS = 4096
 
@@ -296,12 +302,19 @@ class Compactor:
         ]
 
         # Step 3: summarize older conversation history.
+        tracker = get_session_spend()
+        if tracker is not None:
+            tracker.raise_if_exceeded()
+
         response = self._client.messages.create(
             model=MODEL,
             max_tokens=SUMMARIZATION_MAX_TOKENS,
             system=SUMMARIZATION_PROMPT,
             messages=summarization_messages,
         )
+        record_session_spend(response, model=MODEL)
+        if tracker is not None and tracker.exceeded:
+            raise SpendLimitExceeded(tracker)
 
         summary_text = "\n".join(
             block.text

@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -10,8 +11,11 @@ from harness.config import (
     COMPACTION_THRESHOLD,
     COMPACTION_KEEP_RECENT,
     PLAN_REMINDER_INTERVAL,
-    PLAN_FILENAME,
     PLAN_GATED_TOOLS,
+    RALPH_MAX_CONTINUATIONS,
+    RALPH_CONTINUATION_PROMPT,
+    RALPH_STUCK_THRESHOLD,
+    SESSION_SPEND_LIMIT_USD,
 )
 from harness.sandbox import Sandbox
 from harness.tools.bash import set_sandbox
@@ -30,6 +34,26 @@ from harness.planning import (
     plan_exists,
     build_reminder_message,
     build_create_plan_reminder,
+)
+
+from harness.ralph import (
+    should_fire as ralph_should_fire,
+    is_goal_met,
+    snapshot_plan_tasks,
+    open_tasks_fingerprint,
+    build_carry_forward,
+    build_continuation_notice,
+    build_cap_hit_notice,
+    build_stuck_notice,
+    build_no_plan_refusal,
+    build_no_goal_refusal,
+)
+
+from harness.spend import (
+    init_session_spend,
+    get_session_spend,
+    record_session_spend,
+    SpendLimitExceeded,
 )
 
 
@@ -141,9 +165,18 @@ def generate_response(
     tools: list,
     force_no_tools: bool = False,
 ):
-    """Generate a response using Anthropic's Messages API."""
+    """Generate a response using Anthropic's Messages API.
 
-    return client.messages.create(
+    Records estimated spend. Raises SpendLimitExceeded if the session
+    limit was already hit before this call (does not raise after the
+    call — the caller closes out tool_use cleanly, then checks).
+    """
+
+    tracker = get_session_spend()
+    if tracker is not None:
+        tracker.raise_if_exceeded()
+
+    response = client.messages.create(
         model=MODEL,
         max_tokens=MAX_TOKENS,
         system=system_prompt,
@@ -155,6 +188,8 @@ def generate_response(
             else {"type": "auto"}
         ),
     )
+    record_session_spend(response, model=MODEL)
+    return response
 
 
 def extract_text(response) -> str:
@@ -198,12 +233,20 @@ def _consolidate_memory(messages: list, client) -> None:
         # Conversation history contains only Anthropic-compatible
         # user and assistant messages.
         # System instructions are passed separately.
+        tracker = get_session_spend()
+        if tracker is not None and tracker.exceeded:
+            print(
+                "Skipping memory consolidation — spend limit already reached."
+            )
+            return
+
         response = client.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
             system=consolidation_system,
             messages=messages,
         )
+        record_session_spend(response, model=MODEL)
 
         proposed = extract_text(response).strip()
 
@@ -268,15 +311,27 @@ def _run_compaction(
 # Tool dispatch
 # ---------------------------------------------------------
 
+def _tool_call_key(name: str, arguments) -> str:
+    """Canonical key for deduping identical tool calls in one batch."""
+    try:
+        payload = json.dumps(arguments, sort_keys=True, default=str)
+    except TypeError:
+        payload = str(arguments)
+    return f"{name}:{payload}"
+
+
 def dispatch_tools(tool_blocks: list) -> list[dict]:
-    """Execute Anthropic tool calls and return structured results."""
+    """Execute Anthropic tool calls and return structured results.
+
+    Identical (name, input) pairs in the same batch are executed once; later
+    duplicates reuse the first result to avoid wasted work and tokens.
+    """
 
     tool_results = []
     needs_plan = not plan_exists()
+    seen: dict[str, str] = {}
 
     for block in tool_blocks:
-        print(f"Tool: {block.name}")
-
         # Soft prompts were ignored; refuse mutating work until plan.md exists.
         if needs_plan and block.name in PLAN_GATED_TOOLS:
             tool_results.append({
@@ -292,16 +347,32 @@ def dispatch_tools(tool_blocks: list) -> list[dict]:
             print(f"[planning] gated {block.name} — no plan.md yet")
             continue
 
+        key = _tool_call_key(block.name, block.input)
+        if key in seen:
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": (
+                    f"{seen[key]}\n"
+                    "[deduped: identical tool call already executed "
+                    "in this batch]"
+                ),
+            })
+            print(f"Tool: {block.name} (deduped)")
+            continue
+
         try:
             result = registry.dispatch(
                 block.name,
                 block.input,
             )
+            content = str(result)
+            seen[key] = content
 
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
-                "content": str(result),
+                "content": content,
             })
 
             if block.name == "update_plan":
@@ -319,6 +390,240 @@ def dispatch_tools(tool_blocks: list) -> list[dict]:
 
 
 # ---------------------------------------------------------
+# Session context
+# ---------------------------------------------------------
+
+def _build_session_context() -> tuple[list, str]:
+    """Load AGENTS.md + plan.md and return empty history + system prompt."""
+
+    agents_md = load_agents_md()
+    plan_content = load_plan_for_injection()
+
+    if plan_content is not None:
+        print(
+            f"[Loaded plan.md into context: "
+            f"{len(plan_content):,} chars]"
+        )
+
+    system_prompt = build_system_prompt(
+        agents_md=agents_md,
+        plan_content=plan_content,
+    )
+
+    return [], system_prompt
+
+
+# ---------------------------------------------------------
+# ReAct loop
+# ---------------------------------------------------------
+
+def _run_react_loop(
+    messages: list,
+    system_prompt: str,
+    tools: list,
+    compactor: Compactor,
+):
+    """Run tool-calling rounds until the model stops or hits the budget."""
+
+    step_count = 0
+    budget_hit = False
+
+    while True:
+
+        response = generate_response(
+            messages=messages,
+            system_prompt=(
+                system_prompt
+                if not budget_hit
+                else system_prompt + "\n\n" + BUDGET_HIT_MESSAGE
+            ),
+            tools=tools,
+            force_no_tools=budget_hit,
+        )
+
+        # Record Anthropic token usage for compaction.
+        compactor.record_response_usage(response)
+
+        # Preserve the complete assistant response.
+        # This includes text and tool_use blocks.
+        messages.append({
+            "role": "assistant",
+            "content": response.content,
+        })
+
+        tool_blocks = get_tool_use_blocks(response)
+        tracker = get_session_spend()
+        spend_hit = tracker is not None and tracker.exceeded
+
+        # Model has finished its turn.
+        if response.stop_reason != "tool_use":
+            if spend_hit:
+                # Surface the reply the user already paid for, then stop.
+                text = extract_text(response)
+                if text:
+                    print(f"\nagent > {text}\n")
+                raise SpendLimitExceeded(tracker)
+            return response
+
+        # Spend or step budget exhausted: do not execute tools.
+        # Return error results so the Anthropic conversation stays valid.
+        if spend_hit or step_count >= STEP_BUDGET:
+            if spend_hit:
+                err = (
+                    "Session spend limit reached. "
+                    "This tool was not executed."
+                )
+            else:
+                err = (
+                    "Tool execution budget exhausted. "
+                    "This tool was not executed."
+                )
+                budget_hit = True
+
+            messages.append({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": err,
+                        "is_error": True,
+                    }
+                    for block in tool_blocks
+                ],
+            })
+
+            if spend_hit:
+                raise SpendLimitExceeded(tracker)
+
+            continue
+
+        if not tool_blocks:
+            raise RuntimeError(
+                "Anthropic returned stop_reason='tool_use' "
+                "without any tool_use blocks."
+            )
+
+        # Execute all requested tools.
+        tool_results = dispatch_tools(tool_blocks)
+
+        # Append structured results as a user message.
+        messages.append({
+            "role": "user",
+            "content": tool_results,
+        })
+
+        step_count += 1
+
+
+# ---------------------------------------------------------
+# Ralph loop
+# ---------------------------------------------------------
+
+def _run_ralph(
+    messages: list,
+    system_prompt: str,
+    tools: list,
+    compactor: Compactor,
+    goal: str,
+    continuation_prompt: str,
+) -> str:
+    """Drive the agent until the goal is met or a stop condition hits.
+
+    Mutates ``messages`` in place. Returns the (possibly refreshed)
+    system prompt so the outer REPL stays in sync after context resets.
+
+    Continuations clear chat history (to bound cost) but inject a compact
+    carry-forward summary so the agent does not re-explore from scratch.
+    Mid-run follow-up plan items do not block the original goal, and
+    unchanged open-task sets trip an early stuck stop.
+    """
+
+    continuation_count = 0
+    baseline_tasks = snapshot_plan_tasks()
+    next_user_content = continuation_prompt
+    last_fingerprint: frozenset[str] | None = None
+    stuck_streak = 0
+
+    while True:
+        messages.append({
+            "role": "user",
+            "content": next_user_content,
+        })
+
+        # Refresh plan into the system prompt each Ralph iteration.
+        plan_content = load_plan_for_injection()
+        agents_md = load_agents_md()
+        system_prompt = build_system_prompt(
+            agents_md=agents_md,
+            plan_content=plan_content,
+        )
+
+        response = _run_react_loop(
+            messages,
+            system_prompt,
+            tools,
+            compactor,
+        )
+
+        assistant_text = extract_text(response)
+
+        if assistant_text:
+            print(f"\nagent > {assistant_text}\n")
+        else:
+            print(
+                "\n[Ralph] Agent returned no text "
+                "(stop_reason="
+                f"{getattr(response, 'stop_reason', None)}). "
+                "Treating as incomplete.\n"
+            )
+
+        is_done, reason = is_goal_met(
+            client,
+            goal,
+            messages,
+            baseline_tasks=baseline_tasks,
+        )
+
+        if is_done:
+            print(f"[Ralph] Goal met: {reason}")
+            return system_prompt
+
+        fingerprint = open_tasks_fingerprint()
+        if fingerprint == last_fingerprint:
+            stuck_streak += 1
+        else:
+            stuck_streak = 0
+            last_fingerprint = fingerprint
+
+        if stuck_streak >= RALPH_STUCK_THRESHOLD:
+            print(
+                build_stuck_notice(
+                    RALPH_STUCK_THRESHOLD,
+                    sorted(fingerprint),
+                )
+            )
+            return system_prompt
+
+        continuation_count += 1
+
+        if continuation_count > RALPH_MAX_CONTINUATIONS:
+            print(build_cap_hit_notice(RALPH_MAX_CONTINUATIONS))
+            return system_prompt
+
+        print(build_continuation_notice(continuation_count, reason))
+
+        carry = build_carry_forward(goal, reason, assistant_text)
+
+        # Bound cost with a history reset, but keep the same list object
+        # the REPL holds and carry forward a compact resume brief.
+        messages.clear()
+        fresh_messages, system_prompt = _build_session_context()
+        messages.extend(fresh_messages)
+        next_user_content = f"{continuation_prompt}\n\n{carry}"
+
+
+# ---------------------------------------------------------
 # Main agent loop
 # ---------------------------------------------------------
 
@@ -332,30 +637,11 @@ def run():
 
     # Create one Compactor for the entire session.
     compactor = Compactor(client)
+    spend = init_session_spend(SESSION_SPEND_LIMIT_USD, MODEL)
 
     try:
-        # Step 2: Load persistent project memory.
+        messages, system_prompt = _build_session_context()
         agents_md = load_agents_md()
-
-        # Anthropic keeps system instructions outside conversation history.
-        plan_content = load_plan_for_injection()
-
-        print(f"Plan content: {plan_content}")
-        print(f"Agents MD: {agents_md}")
-
-        system_prompt = build_system_prompt(
-            agents_md=agents_md,
-            plan_content=plan_content,
-        )
-
-        if plan_content is not None:
-            print(
-                f"[Loaded plan.md into context: "
-                f"{len(plan_content):,} chars]"
-            )
-
-        # Conversation history contains only user and assistant messages.
-        messages = []
 
         # Convert tool schemas once per session.
         tools = get_anthropic_tools()
@@ -363,9 +649,15 @@ def run():
         # Track planning reminder interval across turns.
         turns_since_reminder = 0
 
+        # Last real user task — used as Ralph's goal.
+        last_substantive_input = None
+
         print(
-            "Agent ready. Type 'quit' or 'exit' to leave. "
+            "Agent ready. Type 'quit' or 'exit' to leave.\n"
             "Type /compact to force compaction.\n"
+            "Type /ralph [instruction] to start Ralph.\n"
+            f"Spend limit: ${SESSION_SPEND_LIMIT_USD:.2f} "
+            f"(estimated from token usage).\n"
         )
 
         while True:
@@ -374,15 +666,27 @@ def run():
             # Automatic compaction
             # -------------------------------------------------
 
-            if compactor.should_compact():
-                _run_compaction(compactor, messages)
+            try:
+                if compactor.should_compact():
+                    _run_compaction(compactor, messages)
+            except SpendLimitExceeded as e:
+                print(str(e))
+                continue
 
             current_tokens = compactor.get_last_token_count()
+            spend_line = f" | Spend: {spend.format_status()}"
 
-            if current_tokens > 0:
+            if current_tokens > 0 or spend.total_usd > 0:
                 print(
                     f"[Context: {current_tokens:,} / "
-                    f"{COMPACTION_THRESHOLD:,} tokens]"
+                    f"{COMPACTION_THRESHOLD:,} tokens{spend_line}]"
+                )
+
+            if spend.exceeded:
+                print(spend.format_limit_notice())
+                print(
+                    "Spend limit reached — further model calls are blocked. "
+                    "Type 'quit' to exit."
                 )
 
             # -------------------------------------------------
@@ -393,6 +697,7 @@ def run():
 
             if user_input.lower() in {"quit", "exit"}:
                 _consolidate_memory(messages, client)
+                print(f"Session spend: {spend.format_status()}")
                 print("Goodbye.")
                 break
 
@@ -401,8 +706,57 @@ def run():
 
             # Manual compaction.
             if user_input == "/compact":
-                _run_compaction(compactor, messages)
+                try:
+                    _run_compaction(compactor, messages)
+                except SpendLimitExceeded as e:
+                    print(str(e))
                 continue
+
+            # Ralph command.
+            if user_input == "/ralph" or user_input.startswith("/ralph "):
+
+                if spend.exceeded:
+                    print(spend.format_limit_notice())
+                    continue
+
+                if not plan_exists():
+                    print(build_no_plan_refusal())
+                    continue
+
+                if not ralph_should_fire(last_substantive_input):
+                    print(build_no_goal_refusal())
+                    continue
+
+                if user_input == "/ralph":
+                    continuation_prompt = RALPH_CONTINUATION_PROMPT
+                else:
+                    continuation_prompt = user_input[len("/ralph "):].strip()
+                    if not continuation_prompt:
+                        continuation_prompt = RALPH_CONTINUATION_PROMPT
+
+                try:
+                    system_prompt = _run_ralph(
+                        messages,
+                        system_prompt,
+                        tools,
+                        compactor,
+                        goal=last_substantive_input,
+                        continuation_prompt=continuation_prompt,
+                    )
+                except SpendLimitExceeded as e:
+                    print(str(e))
+
+                # Reload memory in case Ralph's work updated AGENTS.md
+                # via tools; plan is refreshed each normal turn anyway.
+                agents_md = load_agents_md()
+                continue
+
+            if spend.exceeded:
+                print(spend.format_limit_notice())
+                continue
+
+            # Regular user input.
+            last_substantive_input = user_input
 
             messages.append({
                 "role": "user",
@@ -446,78 +800,22 @@ def run():
             # ReAct dispatch loop
             # -------------------------------------------------
 
-            step_count = 0
-            budget_hit = False
-
-            while True:
-
-                response = generate_response(
-                    messages=messages,
-                    system_prompt=(
-                        turn_system_prompt
-                        if not budget_hit
-                        else turn_system_prompt + "\n\n" + BUDGET_HIT_MESSAGE
-                    ),
-                    tools=tools,
-                    force_no_tools=budget_hit,
+            try:
+                response = _run_react_loop(
+                    messages,
+                    turn_system_prompt,
+                    tools,
+                    compactor,
                 )
+            except SpendLimitExceeded as e:
+                print(str(e))
+                continue
 
-                # Record Anthropic token usage.
-                compactor.record_response_usage(response)
-
-                # Preserve the complete assistant response.
-                # This includes text and tool_use blocks.
-                messages.append({
-                    "role": "assistant",
-                    "content": response.content,
-                })
-
-                tool_blocks = get_tool_use_blocks(response)
-
-                # Model has finished its turn.
-                if response.stop_reason != "tool_use":
-                    break
-
-                # Budget exhausted: do not execute the requested tools.
-                # Instead, return error results for every pending tool_use
-                # so the Anthropic conversation remains valid.
-                if step_count >= STEP_BUDGET:
-                    budget_hit = True
-
-                    messages.append({
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": (
-                                    "Tool execution budget exhausted. "
-                                    "This tool was not executed."
-                                ),
-                                "is_error": True,
-                            }
-                            for block in tool_blocks
-                        ],
-                    })
-
-                    continue
-
-                if not tool_blocks:
-                    raise RuntimeError(
-                        "Anthropic returned stop_reason='tool_use' "
-                        "without any tool_use blocks."
-                    )
-
-                # Execute all requested tools.
-                tool_results = dispatch_tools(tool_blocks)
-
-                # Append structured results as a user message.
-                messages.append({
-                    "role": "user",
-                    "content": tool_results,
-                })
-
-                step_count += 1
+            # Keep the outer system prompt aligned with the latest plan.
+            system_prompt = build_system_prompt(
+                agents_md=agents_md,
+                plan_content=plan_content,
+            )
 
             # -------------------------------------------------
             # Final assistant response
@@ -531,13 +829,13 @@ def run():
                     "Check the API response and termination logic."
                 )
 
-            # The complete assistant response was already appended
-            # to history, so do not append it a second time.
-
             print(f"\nagent > {assistant_text}\n")
 
     finally:
         # Always stop the sandbox, even if an exception occurs.
+        tracker = get_session_spend()
+        if tracker is not None:
+            print(f"Session spend: {tracker.format_status()}")
         print("Stopping sandbox...")
         sandbox.stop()
         print("Sandbox stopped.")

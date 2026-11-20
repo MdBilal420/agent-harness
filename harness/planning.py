@@ -112,12 +112,30 @@ def plan_exists() -> bool:
 
 def has_open_items() -> bool:
     """Check if the plan has any open items."""
+    return bool(get_open_tasks())
+
+
+def get_all_tasks() -> list[dict]:
+    """Return all parsed tasks from plan.md, or [] if missing."""
     path = _plan_path()
     if not path.exists():
-        return False
-    existing_text = path.read_text()
-    tasks = _parse_tasks(existing_text)
-    return any(task["status"] != "done" for task in tasks)
+        return []
+    return _parse_tasks(path.read_text())
+
+
+def get_open_tasks() -> list[str]:
+    """Return texts of tasks that are not done."""
+    return [
+        task["text"]
+        for task in get_all_tasks()
+        if task["status"] != "done"
+    ]
+
+
+def get_all_task_texts() -> set[str]:
+    """Return the set of all task texts currently in plan.md."""
+    return {task["text"] for task in get_all_tasks()}
+
 
 def load_plan_for_injection() -> str | None:
     """Load the plan for injection."""
@@ -129,7 +147,6 @@ def load_plan_for_injection() -> str | None:
         truncated_content = content[:PLAN_INJECTION_MAX_CHARS]
         path.write_text(truncated_content)
         return f"Plan truncated to {PLAN_INJECTION_MAX_CHARS} characters"
-    print(f"Plan: {content}")
     return content
 
 def build_reminder_message() -> str:

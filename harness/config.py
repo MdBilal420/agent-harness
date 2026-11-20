@@ -13,16 +13,20 @@ WORKSPACE_PATH.mkdir(parents=True, exist_ok=True)
 
 
 # -- Model configuration --
-MODEL: str = "claude-haiku-5-5"
+MODEL: str = "claude-haiku-4-5"
 MAX_TOKENS = 8192
 
+
+# Hard stop when estimated Anthropic API spend for the session reaches this.
+# Estimation uses published $/MTok rates (see harness/spend.py).
+SESSION_SPEND_LIMIT_USD: float = 1.0
 
 
 # -- ReAct loop bounds --
 # Maximum number of tool-call rounds per user turn. When hit, the harness
 # forces the model to summarize what it did and hand control back to the
 # user.
-STEP_BUDGET: int = 25
+STEP_BUDGET: int = 15
 
 
 # -- Tool timeouts (seconds) --
@@ -127,3 +131,34 @@ PLAN_GATED_TOOLS: set[str] = {
     "git_checkout",
     "git_branch",
 }
+
+#  Ralph Loop
+RALPH_MAX_CONTINUATIONS: int = 5
+
+# Stop early if the open-task set is unchanged this many times in a row.
+RALPH_STUCK_THRESHOLD: int = 2
+
+RALPH_CONTINUATION_PROMPT: str = "continue"
+
+# Max chars of prior-iteration summary carried into a Ralph continuation.
+RALPH_CARRY_FORWARD_CHARS: int = 3000
+
+RALPH_EVAL_MODEL: str = MODEL
+
+RALPH_EVAL_PROMPT: str = """You are evaluating whether an agent has completed a user's task.
+
+Original user goal:
+{goal}
+
+Current plan state (from plan.md):
+{plan}
+
+Recent conversation summary:
+{recent_summary}
+
+Has the goal been met? Answer with exactly one of:
+- "DONE: <one-sentence reason>" if the goal is fully satisfied
+- "NOT_DONE: <one-sentence reason>" if meaningful work remains
+
+Be strict — if the agent's work is partial, incomplete, unverified, or if
+there are open plan items that haven't been addressed, answer NOT_DONE."""

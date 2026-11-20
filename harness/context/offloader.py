@@ -15,7 +15,9 @@ CHARS_PER_TOKEN = 4
 
 OFFLOAD_SUBDIR = ".tool_outputs"
 
-NEVER_OFFLOAD_TOOLS = {"read"}
+# Never offload reads — otherwise the model is told to call read_file() on an
+# offload path, that read gets truncated again, and it loops forever.
+NEVER_OFFLOAD_TOOLS = {"read", "read_file"}
 
 
 def _offload_dir() -> Path:
