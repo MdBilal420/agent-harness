@@ -129,7 +129,7 @@ def load_plan_for_injection() -> str | None:
         truncated_content = content[:PLAN_INJECTION_MAX_CHARS]
         path.write_text(truncated_content)
         return f"Plan truncated to {PLAN_INJECTION_MAX_CHARS} characters"
-    print(f"Plan: {content}")
+    # print(f"Plan: {content}")
     return content
 
 def build_reminder_message() -> str:

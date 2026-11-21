@@ -15,7 +15,7 @@ CHARS_PER_TOKEN = 4
 
 OFFLOAD_SUBDIR = ".tool_outputs"
 
-NEVER_OFFLOAD_TOOLS = {"read"}
+NEVER_OFFLOAD_TOOLS = {"read_file"}
 
 
 def _offload_dir() -> Path:

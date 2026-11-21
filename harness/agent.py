@@ -6,6 +6,9 @@ from dotenv import load_dotenv
 
 from harness.tools import registry
 from harness.config import (
+    MODEL as DEFAULT_MODEL,
+    MAX_TOKENS as DEFAULT_MAX_TOKENS,
+    OLLAMA_BASE_URL,
     STEP_BUDGET,
     COMPACTION_THRESHOLD,
     COMPACTION_KEEP_RECENT,
@@ -35,11 +38,15 @@ from harness.planning import (
 
 load_dotenv()
 
-MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5")
-MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "8192"))
+MODEL = os.getenv("ANTHROPIC_MODEL", DEFAULT_MODEL)
+MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", str(DEFAULT_MAX_TOKENS)))
 
+# Point at local Ollama by default (Anthropic Messages API compatibility).
+# Set ANTHROPIC_BASE_URL empty and a real ANTHROPIC_API_KEY for Anthropic cloud.
+_base_url = os.getenv("ANTHROPIC_BASE_URL", OLLAMA_BASE_URL)
 client = anthropic.Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
+    api_key=os.getenv("ANTHROPIC_API_KEY", "ollama"),
+    base_url=_base_url or None,
 )
 
 
@@ -141,20 +148,24 @@ def generate_response(
     tools: list,
     force_no_tools: bool = False,
 ):
-    """Generate a response using Anthropic's Messages API."""
+    """Generate a response using Anthropic's Messages API.
 
-    return client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        system=system_prompt,
-        messages=messages,
-        tools=tools,
-        tool_choice=(
-            {"type": "none"}
-            if force_no_tools
-            else {"type": "auto"}
-        ),
-    )
+    Omits tools when force_no_tools is set (Ollama does not support
+    tool_choice), and skips tool_choice entirely so the same path works
+    against both Ollama and Anthropic cloud.
+    """
+
+    kwargs = {
+        "model": MODEL,
+        "max_tokens": MAX_TOKENS,
+        "system": system_prompt,
+        "messages": messages,
+    }
+
+    if not force_no_tools:
+        kwargs["tools"] = tools
+
+    return client.messages.create(**kwargs)
 
 
 def extract_text(response) -> str:
@@ -340,8 +351,8 @@ def run():
         # Anthropic keeps system instructions outside conversation history.
         plan_content = load_plan_for_injection()
 
-        print(f"Plan content: {plan_content}")
-        print(f"Agents MD: {agents_md}")
+        # print(f"Plan content: {plan_content}")
+        # print(f"Agents MD: {agents_md}")
 
         system_prompt = build_system_prompt(
             agents_md=agents_md,
@@ -462,8 +473,13 @@ def run():
                     force_no_tools=budget_hit,
                 )
 
-                # Record Anthropic token usage.
+                # Record token usage. Ollama may return null counts —
+                # fall back to a char-based estimate so compaction still works.
                 compactor.record_response_usage(response)
+                if compactor.get_last_token_count() == 0:
+                    compactor.record_token_usage(
+                        compactor.approximate_char_count(messages)
+                    )
 
                 # Preserve the complete assistant response.
                 # This includes text and tool_use blocks.

@@ -242,16 +242,29 @@ class Compactor:
         self._last_token_count = input_tokens
 
     def record_response_usage(self, response) -> None:
-        """Record total input usage, including cached input tokens."""
-        usage = response.usage
+        """Record total input usage, including cached input tokens.
+
+        Ollama's Anthropic-compatible endpoint may return null token
+        counts; treat missing values as 0 and fall back to a char-based
+        estimate when the provider reports nothing useful.
+        """
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+
+        def _tokens(value) -> int:
+            return value if isinstance(value, int) else 0
 
         total = (
-            usage.input_tokens
-            + getattr(usage, "cache_creation_input_tokens", 0)
-            + getattr(usage, "cache_read_input_tokens", 0)
+            _tokens(getattr(usage, "input_tokens", None))
+            + _tokens(getattr(usage, "cache_creation_input_tokens", None))
+            + _tokens(getattr(usage, "cache_read_input_tokens", None))
         )
 
-        self._last_token_count = total
+        # Skip overwrite when the provider reports zeros/nulls; the
+        # caller can fall back to approximate_char_count.
+        if total > 0:
+            self._last_token_count = total
 
     def get_last_token_count(self) -> int:
         """Return the latest recorded input token count."""

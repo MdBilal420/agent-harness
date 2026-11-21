@@ -13,8 +13,13 @@ WORKSPACE_PATH.mkdir(parents=True, exist_ok=True)
 
 
 # -- Model configuration --
-MODEL: str = "claude-haiku-5-5"
+# Local Ollama model (see `ollama list`). Override with ANTHROPIC_MODEL.
+MODEL: str = "qwen3.5:9b"
 MAX_TOKENS = 8192
+
+# Ollama Anthropic-compatible endpoint. Use Anthropic cloud by leaving
+# ANTHROPIC_BASE_URL unset and setting a real ANTHROPIC_API_KEY.
+OLLAMA_BASE_URL: str = "http://localhost:11434"
 
 
 
@@ -94,7 +99,7 @@ RAG_DEFAULT_RESULTS: int = 5
 
 # Compaction
 
-COMPACTION_THRESHOLD: int = 30000
+COMPACTION_THRESHOLD: int = 60000
 # COMPACTION_THRESHOLD: int = 10000000
 
 
