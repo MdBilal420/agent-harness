@@ -3,13 +3,11 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from anthropic import Anthropic
-
 from harness.config import (
-    MODEL,
     COMPACTION_THRESHOLD,
     COMPACTION_KEEP_RECENT,
 )
+from harness.llm import resolve_model
 
 
 SUMMARIZATION_MAX_TOKENS = 4096
@@ -232,7 +230,7 @@ def _offload(messages: list, summary: str) -> None:
 class Compactor:
     """Owns the compaction lifecycle for an Anthropic agent."""
 
-    def __init__(self, client: Anthropic):
+    def __init__(self, client):
         self._client = client
 
         self._last_token_count: int = 0
@@ -310,7 +308,7 @@ class Compactor:
 
         # Step 3: summarize older conversation history.
         response = self._client.messages.create(
-            model=MODEL,
+            model=resolve_model(),
             max_tokens=SUMMARIZATION_MAX_TOKENS,
             system=SUMMARIZATION_PROMPT,
             messages=summarization_messages,

@@ -1,20 +1,21 @@
-import os
 from pathlib import Path
 
-import anthropic
 from dotenv import load_dotenv
 
 from harness.tools import registry
 from harness.config import (
-    MODEL as DEFAULT_MODEL,
-    MAX_TOKENS as DEFAULT_MAX_TOKENS,
-    OLLAMA_BASE_URL,
     STEP_BUDGET,
     COMPACTION_THRESHOLD,
     COMPACTION_KEEP_RECENT,
     PLAN_REMINDER_INTERVAL,
     PLAN_FILENAME,
     PLAN_GATED_TOOLS,
+)
+from harness.llm import (
+    build_client,
+    resolve_max_tokens,
+    resolve_model,
+    resolve_provider,
 )
 from harness.sandbox import Sandbox
 from harness.tools.bash import set_sandbox
@@ -38,16 +39,10 @@ from harness.planning import (
 
 load_dotenv()
 
-MODEL = os.getenv("ANTHROPIC_MODEL", DEFAULT_MODEL)
-MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", str(DEFAULT_MAX_TOKENS)))
-
-# Point at local Ollama by default (Anthropic Messages API compatibility).
-# Set ANTHROPIC_BASE_URL empty and a real ANTHROPIC_API_KEY for Anthropic cloud.
-_base_url = os.getenv("ANTHROPIC_BASE_URL", OLLAMA_BASE_URL)
-client = anthropic.Anthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY", "ollama"),
-    base_url=_base_url or None,
-)
+PROVIDER = resolve_provider()
+MODEL = resolve_model(PROVIDER)
+MAX_TOKENS = resolve_max_tokens()
+client = build_client(PROVIDER)
 
 
 # Tool budget message.

@@ -13,13 +13,20 @@ WORKSPACE_PATH.mkdir(parents=True, exist_ok=True)
 
 
 # -- Model configuration --
-# Local Ollama model (see `ollama list`). Override with ANTHROPIC_MODEL.
+# Defaults used when LLM_PROVIDER is unset / ollama. Override with
+# ANTHROPIC_MODEL (or BEDROCK_MODEL for Bedrock).
 MODEL: str = "qwen3.5:9b"
 MAX_TOKENS = 8192
 
-# Ollama Anthropic-compatible endpoint. Use Anthropic cloud by leaving
-# ANTHROPIC_BASE_URL unset and setting a real ANTHROPIC_API_KEY.
+# Ollama Anthropic-compatible endpoint.
 OLLAMA_BASE_URL: str = "http://localhost:11434"
+
+# Amazon Bedrock (AnthropicBedrock + IAM SigV4). Prefer inference-profile
+# IDs (global./apac./us.) — bare anthropic.* ids often 400 on newer models.
+BEDROCK_DEFAULT_MODEL: str = (
+    "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+)
+BEDROCK_DEFAULT_REGION: str = "ap-southeast-2"
 
 
 
