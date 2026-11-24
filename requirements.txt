@@ -4,3 +4,4 @@ docker>=7.0
 tavily-python>=0.8.0
 chromadb>=0.5.0
 voyageai>=0.4.0
+langsmith>=0.14.9

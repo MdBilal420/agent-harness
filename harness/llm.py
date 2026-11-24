@@ -6,6 +6,7 @@ import os
 from typing import Literal
 
 import anthropic
+from langsmith.wrappers import wrap_anthropic
 
 from harness.config import (
     MODEL as DEFAULT_MODEL,
@@ -79,7 +80,11 @@ def resolve_max_tokens() -> int:
 
 
 def build_client(provider: Provider | None = None):
-    """Build an Anthropic-compatible Messages API client."""
+    """Build an Anthropic-compatible Messages API client.
+
+    All clients are wrapped with LangSmith ``wrap_anthropic`` so model
+    calls nest under ``@traceable`` spans when ``LANGSMITH_TRACING`` is on.
+    """
     provider = provider or resolve_provider()
 
     if provider == "bedrock":
@@ -107,7 +112,7 @@ def build_client(provider: Provider | None = None):
                 kwargs["aws_session_token"] = session_token
             if profile:
                 kwargs["aws_profile"] = profile
-            return anthropic.AnthropicBedrock(**kwargs)
+            return wrap_anthropic(anthropic.AnthropicBedrock(**kwargs))
 
         api_key = (
             os.getenv("AWS_BEARER_TOKEN_BEDROCK")
@@ -115,15 +120,15 @@ def build_client(provider: Provider | None = None):
         )
         if api_key:
             kwargs["api_key"] = api_key
-            return anthropic.AnthropicBedrock(**kwargs)
+            return wrap_anthropic(anthropic.AnthropicBedrock(**kwargs))
 
         # Fall through to default credential chain (~/.aws/credentials).
-        return anthropic.AnthropicBedrock(**kwargs)
+        return wrap_anthropic(anthropic.AnthropicBedrock(**kwargs))
 
     if provider == "anthropic":
-        return anthropic.Anthropic(
+        return wrap_anthropic(anthropic.Anthropic(
             api_key=os.getenv("ANTHROPIC_API_KEY"),
-        )
+        ))
 
     if provider == "openrouter":
         headers = {
@@ -132,18 +137,18 @@ def build_client(provider: Provider | None = None):
         referer = os.getenv("OPENROUTER_HTTP_REFERER", "")
         if referer:
             headers["HTTP-Referer"] = referer
-        return anthropic.Anthropic(
+        return wrap_anthropic(anthropic.Anthropic(
             api_key=(
                 os.getenv("OPENROUTER_API_KEY")
                 or os.getenv("ANTHROPIC_API_KEY")
             ),
             base_url=OPENROUTER_BASE_URL,
             default_headers=headers,
-        )
+        ))
 
     # ollama — Anthropic Messages API compatibility
     base_url = os.getenv("ANTHROPIC_BASE_URL", OLLAMA_BASE_URL)
-    return anthropic.Anthropic(
+    return wrap_anthropic(anthropic.Anthropic(
         api_key=os.getenv("ANTHROPIC_API_KEY", "ollama"),
         base_url=base_url or None,
-    )
+    ))

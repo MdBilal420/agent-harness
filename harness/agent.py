@@ -1,6 +1,9 @@
 from pathlib import Path
+from uuid import uuid4
 
 from dotenv import load_dotenv
+from langsmith import Client as LangSmithClient
+from langsmith import traceable
 
 from harness.tools import registry
 from harness.config import (
@@ -37,6 +40,7 @@ from harness.planning import (
 )
 
 
+# Load .env before any LangSmith/LLM clients read tracing destination vars.
 load_dotenv()
 
 PROVIDER = resolve_provider()
@@ -137,6 +141,7 @@ def build_system_prompt(
 # Anthropic API
 # ---------------------------------------------------------
 
+@traceable(name="generate_response")
 def generate_response(
     messages: list,
     system_prompt: str,
@@ -148,6 +153,9 @@ def generate_response(
     Omits tools when force_no_tools is set (Ollama does not support
     tool_choice), and skips tool_choice entirely so the same path works
     against both Ollama and Anthropic cloud.
+
+    The Anthropic client is LangSmith-wrapped, so the Messages API call
+    nests as an LLM child span under this run.
     """
 
     kwargs = {
@@ -274,11 +282,18 @@ def _run_compaction(
 # Tool dispatch
 # ---------------------------------------------------------
 
-def dispatch_tools(tool_blocks: list) -> list[dict]:
+@traceable(name="dispatch_tools", run_type="chain")
+def dispatch_tools(
+    tool_blocks: list,
+    thread_id: str | None = None,
+) -> list[dict]:
     """Execute Anthropic tool calls and return structured results."""
 
     tool_results = []
     needs_plan = not plan_exists()
+    tool_meta = (
+        {"metadata": {"thread_id": thread_id}} if thread_id else None
+    )
 
     for block in tool_blocks:
         print(f"Tool: {block.name}")
@@ -299,10 +314,14 @@ def dispatch_tools(tool_blocks: list) -> list[dict]:
             continue
 
         try:
-            result = registry.dispatch(
-                block.name,
-                block.input,
-            )
+            if tool_meta is not None:
+                result = _execute_tool(
+                    block.name,
+                    block.input,
+                    langsmith_extra=tool_meta,
+                )
+            else:
+                result = _execute_tool(block.name, block.input)
 
             tool_results.append({
                 "type": "tool_result",
@@ -324,12 +343,170 @@ def dispatch_tools(tool_blocks: list) -> list[dict]:
     return tool_results
 
 
+@traceable(name="execute_tool", run_type="tool")
+def _execute_tool(name: str, tool_input: dict):
+    """Run a single registry tool as its own LangSmith tool span."""
+    return registry.dispatch(name, tool_input)
+
+
 # ---------------------------------------------------------
 # Main agent loop
 # ---------------------------------------------------------
 
+@traceable(name="agent_turn", run_type="chain")
+def handle_turn(
+    user_input: str,
+    messages: list,
+    tools: list,
+    agents_md: str,
+    compactor: Compactor,
+    turns_since_reminder: int,
+    thread_id: str,
+) -> tuple[str, int]:
+    """Run one user turn (planning reminder + ReAct tool loop).
+
+    Returns the assistant text and the updated turns_since_reminder counter.
+    LangSmith nests model (wrap_anthropic) and tool spans under this root.
+    """
+
+    # Attach thread_id on every child run (LangSmith does not inherit it).
+    turn_meta = {"metadata": {"thread_id": thread_id}}
+
+    messages.append({
+        "role": "user",
+        "content": user_input,
+    })
+
+    turns_since_reminder += 1
+
+    # Always refresh plan content from disk so updates stick mid-session.
+    plan_content = load_plan_for_injection()
+
+    reminder = None
+    if not plan_exists():
+        # Inject on every turn until a plan exists (interval alone
+        # skipped turn 1, which is when most scaffolding happens).
+        reminder = build_create_plan_reminder()
+    elif (
+        turns_since_reminder >= PLAN_REMINDER_INTERVAL
+        and has_open_items()
+    ):
+        reminder = build_reminder_message()
+        turns_since_reminder = 0
+
+    turn_system_prompt = build_system_prompt(
+        agents_md=agents_md,
+        plan_content=plan_content,
+        extra_context=reminder or "",
+    )
+
+    if reminder:
+        print(
+            f"[Planning reminder injected — "
+            f"{turns_since_reminder} turns since last]"
+        )
+
+    step_count = 0
+    budget_hit = False
+    response = None
+
+    while True:
+
+        response = generate_response(
+            messages=messages,
+            system_prompt=(
+                turn_system_prompt
+                if not budget_hit
+                else turn_system_prompt + "\n\n" + BUDGET_HIT_MESSAGE
+            ),
+            tools=tools,
+            force_no_tools=budget_hit,
+            langsmith_extra=turn_meta,
+        )
+
+        # Record token usage. Ollama may return null counts —
+        # fall back to a char-based estimate so compaction still works.
+        compactor.record_response_usage(response)
+        if compactor.get_last_token_count() == 0:
+            compactor.record_token_usage(
+                compactor.approximate_char_count(messages)
+            )
+
+        # Preserve the complete assistant response.
+        # This includes text and tool_use blocks.
+        messages.append({
+            "role": "assistant",
+            "content": response.content,
+        })
+
+        tool_blocks = get_tool_use_blocks(response)
+
+        # Model has finished its turn.
+        if response.stop_reason != "tool_use":
+            break
+
+        # Budget exhausted: do not execute the requested tools.
+        # Instead, return error results for every pending tool_use
+        # so the Anthropic conversation remains valid.
+        if step_count >= STEP_BUDGET:
+            budget_hit = True
+
+            messages.append({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": (
+                            "Tool execution budget exhausted. "
+                            "This tool was not executed."
+                        ),
+                        "is_error": True,
+                    }
+                    for block in tool_blocks
+                ],
+            })
+
+            continue
+
+        if not tool_blocks:
+            raise RuntimeError(
+                "Anthropic returned stop_reason='tool_use' "
+                "without any tool_use blocks."
+            )
+
+        # Execute all requested tools.
+        tool_results = dispatch_tools(
+            tool_blocks,
+            thread_id,
+            langsmith_extra=turn_meta,
+        )
+
+        # Append structured results as a user message.
+        messages.append({
+            "role": "user",
+            "content": tool_results,
+        })
+
+        step_count += 1
+
+    assistant_text = extract_text(response)
+
+    if not assistant_text:
+        raise RuntimeError(
+            "Agent loop terminated without a text response. "
+            "Check the API response and termination logic."
+        )
+
+    return assistant_text, turns_since_reminder
+
+
 def run():
     """Run the agent's conversation loop until the user quits."""
+
+    # One thread_id per interactive session so multi-turn traces group.
+    thread_id = str(uuid4())
+    langsmith_client = LangSmithClient()
 
     # Step 1: Start sandbox and connect it to the bash tool.
     sandbox = Sandbox()
@@ -345,14 +522,6 @@ def run():
 
         # Anthropic keeps system instructions outside conversation history.
         plan_content = load_plan_for_injection()
-
-        # print(f"Plan content: {plan_content}")
-        # print(f"Agents MD: {agents_md}")
-
-        system_prompt = build_system_prompt(
-            agents_md=agents_md,
-            plan_content=plan_content,
-        )
 
         if plan_content is not None:
             print(
@@ -372,6 +541,7 @@ def run():
         print(
             "Agent ready. Type 'quit' or 'exit' to leave. "
             "Type /compact to force compaction.\n"
+            f"[LangSmith thread_id={thread_id}]\n"
         )
 
         while True:
@@ -410,137 +580,20 @@ def run():
                 _run_compaction(compactor, messages)
                 continue
 
-            messages.append({
-                "role": "user",
-                "content": user_input,
-            })
-
             # -------------------------------------------------
-            # Planning reminder
+            # Traced ReAct turn
             # -------------------------------------------------
 
-            turns_since_reminder += 1
-
-            # Always refresh plan content from disk so updates stick mid-session.
-            plan_content = load_plan_for_injection()
-
-            reminder = None
-            if not plan_exists():
-                # Inject on every turn until a plan exists (interval alone
-                # skipped turn 1, which is when most scaffolding happens).
-                reminder = build_create_plan_reminder()
-            elif (
-                turns_since_reminder >= PLAN_REMINDER_INTERVAL
-                and has_open_items()
-            ):
-                reminder = build_reminder_message()
-                turns_since_reminder = 0
-
-            turn_system_prompt = build_system_prompt(
-                agents_md=agents_md,
-                plan_content=plan_content,
-                extra_context=reminder or "",
+            assistant_text, turns_since_reminder = handle_turn(
+                user_input,
+                messages,
+                tools,
+                agents_md,
+                compactor,
+                turns_since_reminder,
+                thread_id,
+                langsmith_extra={"metadata": {"thread_id": thread_id}},
             )
-
-            if reminder:
-                print(
-                    f"[Planning reminder injected — "
-                    f"{turns_since_reminder} turns since last]"
-                )
-
-            # -------------------------------------------------
-            # ReAct dispatch loop
-            # -------------------------------------------------
-
-            step_count = 0
-            budget_hit = False
-
-            while True:
-
-                response = generate_response(
-                    messages=messages,
-                    system_prompt=(
-                        turn_system_prompt
-                        if not budget_hit
-                        else turn_system_prompt + "\n\n" + BUDGET_HIT_MESSAGE
-                    ),
-                    tools=tools,
-                    force_no_tools=budget_hit,
-                )
-
-                # Record token usage. Ollama may return null counts —
-                # fall back to a char-based estimate so compaction still works.
-                compactor.record_response_usage(response)
-                if compactor.get_last_token_count() == 0:
-                    compactor.record_token_usage(
-                        compactor.approximate_char_count(messages)
-                    )
-
-                # Preserve the complete assistant response.
-                # This includes text and tool_use blocks.
-                messages.append({
-                    "role": "assistant",
-                    "content": response.content,
-                })
-
-                tool_blocks = get_tool_use_blocks(response)
-
-                # Model has finished its turn.
-                if response.stop_reason != "tool_use":
-                    break
-
-                # Budget exhausted: do not execute the requested tools.
-                # Instead, return error results for every pending tool_use
-                # so the Anthropic conversation remains valid.
-                if step_count >= STEP_BUDGET:
-                    budget_hit = True
-
-                    messages.append({
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": (
-                                    "Tool execution budget exhausted. "
-                                    "This tool was not executed."
-                                ),
-                                "is_error": True,
-                            }
-                            for block in tool_blocks
-                        ],
-                    })
-
-                    continue
-
-                if not tool_blocks:
-                    raise RuntimeError(
-                        "Anthropic returned stop_reason='tool_use' "
-                        "without any tool_use blocks."
-                    )
-
-                # Execute all requested tools.
-                tool_results = dispatch_tools(tool_blocks)
-
-                # Append structured results as a user message.
-                messages.append({
-                    "role": "user",
-                    "content": tool_results,
-                })
-
-                step_count += 1
-
-            # -------------------------------------------------
-            # Final assistant response
-            # -------------------------------------------------
-
-            assistant_text = extract_text(response)
-
-            if not assistant_text:
-                raise RuntimeError(
-                    "Agent loop terminated without a text response. "
-                    "Check the API response and termination logic."
-                )
 
             # The complete assistant response was already appended
             # to history, so do not append it a second time.
@@ -552,6 +605,11 @@ def run():
         print("Stopping sandbox...")
         sandbox.stop()
         print("Sandbox stopped.")
+        # Tracing posts in the background; flush so the last turn lands.
+        try:
+            langsmith_client.flush()
+        except Exception as e:
+            print(f"[LangSmith flush skipped: {e}]")
 
 
 if __name__ == "__main__":
