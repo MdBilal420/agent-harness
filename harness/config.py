@@ -13,8 +13,20 @@ WORKSPACE_PATH.mkdir(parents=True, exist_ok=True)
 
 
 # -- Model configuration --
-MODEL: str = "claude-haiku-5-5"
+# Defaults used when LLM_PROVIDER is unset / ollama. Override with
+# ANTHROPIC_MODEL (or BEDROCK_MODEL for Bedrock).
+MODEL: str = "qwen3.5:9b"
 MAX_TOKENS = 8192
+
+# Ollama Anthropic-compatible endpoint.
+OLLAMA_BASE_URL: str = "http://localhost:11434"
+
+# Amazon Bedrock (AnthropicBedrock + IAM SigV4). Prefer inference-profile
+# IDs (global./apac./us.) — bare anthropic.* ids often 400 on newer models.
+BEDROCK_DEFAULT_MODEL: str = (
+    "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+)
+BEDROCK_DEFAULT_REGION: str = "ap-southeast-2"
 
 
 
@@ -94,18 +106,36 @@ RAG_DEFAULT_RESULTS: int = 5
 
 # Compaction
 
-# COMPACTION_THRESHOLD: int = 30000
-COMPACTION_THRESHOLD: int = 10000000
+COMPACTION_THRESHOLD: int = 60000
+# COMPACTION_THRESHOLD: int = 10000000
 
 
 COMPACTION_KEEP_RECENT: int = 3
 
 # Tool Offloading
 
-# OFFLOAD_THRESHOLD_TOKENS: int = 1000
-OFFLOAD_THRESHOLD_TOKENS: int = 1000000
+OFFLOAD_THRESHOLD_TOKENS: int = 20000
+# OFFLOAD_THRESHOLD_TOKENS: int = 1000000
 
 
 OFFLOAD_HEAD_TOKENS: int = 300
 
 OFFLOAD_TAIL_TOKENS: int = 300
+
+# Planning Support
+
+PLAN_FILENAME: str = "plan.md"
+
+PLAN_REMINDER_INTERVAL: int = 2
+
+PLAN_INJECTION_MAX_CHARS: int = 5000
+
+PLAN_GATED_TOOLS: set[str] = {
+    "write_file",
+    "delete_file",
+    "create_directory",
+    "bash",
+    "git_commit",
+    "git_checkout",
+    "git_branch",
+}

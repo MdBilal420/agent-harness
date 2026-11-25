@@ -3,13 +3,11 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from anthropic import Anthropic
-
 from harness.config import (
-    MODEL,
     COMPACTION_THRESHOLD,
     COMPACTION_KEEP_RECENT,
 )
+from harness.llm import resolve_model
 
 
 SUMMARIZATION_MAX_TOKENS = 4096
@@ -232,7 +230,7 @@ def _offload(messages: list, summary: str) -> None:
 class Compactor:
     """Owns the compaction lifecycle for an Anthropic agent."""
 
-    def __init__(self, client: Anthropic):
+    def __init__(self, client):
         self._client = client
 
         self._last_token_count: int = 0
@@ -242,20 +240,29 @@ class Compactor:
         self._last_token_count = input_tokens
 
     def record_response_usage(self, response) -> None:
-        """Record total input usage, including cached input tokens."""
-        usage = response.usage
+        """Record total input usage, including cached input tokens.
 
-        print("USAGA")
-        print("Input tokens: ", usage.input_tokens)
-        print("Cache creation input tokens: ", getattr(usage, "cache_creation_input_tokens", 0))
-        print("Cache read input tokens: ", getattr(usage, "cache_read_input_tokens", 0))
+        Ollama's Anthropic-compatible endpoint may return null token
+        counts; treat missing values as 0 and fall back to a char-based
+        estimate when the provider reports nothing useful.
+        """
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+
+        def _tokens(value) -> int:
+            return value if isinstance(value, int) else 0
+
         total = (
-            usage.input_tokens
-            + getattr(usage, "cache_creation_input_tokens", 0)
-            + getattr(usage, "cache_read_input_tokens", 0)
+            _tokens(getattr(usage, "input_tokens", None))
+            + _tokens(getattr(usage, "cache_creation_input_tokens", None))
+            + _tokens(getattr(usage, "cache_read_input_tokens", None))
         )
 
-        self._last_token_count = total
+        # Skip overwrite when the provider reports zeros/nulls; the
+        # caller can fall back to approximate_char_count.
+        if total > 0:
+            self._last_token_count = total
 
     def get_last_token_count(self) -> int:
         """Return the latest recorded input token count."""
@@ -301,7 +308,7 @@ class Compactor:
 
         # Step 3: summarize older conversation history.
         response = self._client.messages.create(
-            model=MODEL,
+            model=resolve_model(),
             max_tokens=SUMMARIZATION_MAX_TOKENS,
             system=SUMMARIZATION_PROMPT,
             messages=summarization_messages,

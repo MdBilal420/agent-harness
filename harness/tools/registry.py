@@ -49,7 +49,7 @@ class ToolRegistry:
         if name not in self._tools:
             raise ValueError(f"Tool {name} not found")
 
-        print(f"Tool: {name} Arguments: {arguments}")
+        print(f"Tool: {name}")
 
         try:
             tool = self._tools[name]
